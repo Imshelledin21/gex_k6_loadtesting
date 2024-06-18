@@ -1,0 +1,361 @@
+# kubectl -n fo-monitoring-gel apply -f k6-logs-bench-k8s.yaml
+# kubectl -n fo-monitoring-gel delete -f k6-logs-bench-k8s.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-job
+data:
+  script.js: |-
+    import { check, fail } from 'k6';
+    import loki from 'k6/x/loki';
+
+    /*
+    * Host name with port
+    * @constant {string}
+    */
+    const HOST = __ENV.BASE_URL || fail("provide BASE_URL when starting k6");
+
+    /**
+    * Name of the Loki tenant
+    * @constant {string}
+    */
+    const TENANT_ID = __ENV.USERNAME || fail("provide USERNAME when starting k6");
+
+    /**
+    * Access token of the Loki tenant with logs:write and logs:read permissions
+    * @constant {string}
+    */
+    const ACCESS_TOKEN = __ENV.WRITE_TOKEN || fail("provide WRITE_TOKEN when starting k6");
+
+    /**
+    * URL used for push and query requests
+    * Path is automatically appended by the client
+    * @constant {string}
+    */
+    const BASE_URL = `http://${TENANT_ID}:${ACCESS_TOKEN}@${HOST}`;
+
+    /**
+    * Constants for byte values
+    * @constant {number}
+    */
+    const KB = 1024;
+    const MB = KB * KB;
+
+    export const options = {
+      thresholds: {
+        'http_req_failed': [{ threshold: 'rate<=0.01', abortOnFail: false }],
+      },
+      scenarios: {
+        write: {
+          exec: 'write',
+          executor: 'ramping-arrival-rate',  // https://k6.io/docs/using-k6/scenarios/executors/ramping-arrival-rate
+          startRate: 1,  // Number of iterations to execute each timeUnit period at test start.
+          timeUnit: '3s',  // Period of time to apply the startRate to the stages' target value. Its value is constant for the whole duration of the scenario, it is not possible to change it for a specific stage.
+          preAllocatedVUs: 10,  // Number of VUs to pre-allocate before test start in order to preserve runtime resources.
+          maxVUs: 15,  // Maximum number of VUs to allow during the test run.
+          stages: [
+            { duration: '5m', target: 1 },  // first 5 min, ramp up to 100 iteration per sec (rate)
+            // { duration: '40m', target: 150 },  // next 40 min, ramp up to 150 iteration per sec (rate)
+            // { duration: '5m', target: 10 },  // next 5 min, ramp up to 10 iteration per sec (rate)
+          ],
+        },
+        read: {
+          exec: 'read',
+          executor: 'ramping-arrival-rate',
+          startRate: 5,  // Number of iterations to execute each timeUnit period at test start.
+          timeUnit: '10s',
+          preAllocatedVUs: 50,
+          maxVUs: 100,  // Maximum number of VUs to allow during the test run.
+          stages: [
+            { duration: '5m', target: 15 },  // first 5 min, ramp up to 10 iteration per sec (rate)
+          ],
+        },
+      },
+    };
+
+    // https://github.com/grafana/xk6-loki#labels
+    // app 3 * format 6 * namespace 1 * os * 3 pod 6 = 972 loki streams
+    // 972 loki streams * instance (vu's) 15 = 14580 loki streams
+    const labelCardinality = {
+      "app": 3,
+      "namespace": 1,
+      "pod": 6,
+    };
+
+    const write_conf = new loki.Config(BASE_URL, 10000, 0.9, labelCardinality);
+    const write_client = new loki.Client(write_conf);
+    const read_conf = new loki.Config(BASE_URL, 60000, 0.9, labelCardinality);
+    const read_client = new loki.Client(read_conf); 
+
+    /**
+    * Entrypoint for write scenario
+    */
+    export function write() {
+      let streams = randomInt(4, 8);
+      // Pick random size between min bound and max bound
+      // Generate logs till size is above the randome picked size.
+      let res = write_client.pushParameterized(streams, 800 * KB, 1 * MB);
+      // let res = write_client.pushParameterized(streams, 1 * KB, 4 * KB);
+      check(res,
+        {
+          'successful write': (res) => {
+            let success = res.status === 204;
+            if (!success) console.log(res.status, res.body);
+            return success;
+          },
+        }
+      );
+    }
+
+    /**
+    * Return a random integer between min and max including min and max
+    */
+    function randomInt(min, max) {
+      return Math.floor(Math.random() * (max - min + 1) + min);
+    }
+
+    const createSelectorByRatio = (ratioConfig) => {
+      let ratioSum = 0;
+      const executorsIntervals = [];
+      for (let i = 0; i < ratioConfig.length; i++) {
+        executorsIntervals.push({
+          start: ratioSum,
+          end: ratioSum + ratioConfig[i].ratio,
+          item: ratioConfig[i].item,
+        })
+        ratioSum += ratioConfig[i].ratio
+      }
+      return (random) => {
+        if (random >= 1 || random < 0) {
+          fail(`random value must be within range [0-1)`)
+        }
+        const value = random * ratioSum;
+        for (let i = 0; i < executorsIntervals.length; i++) {
+          let currentInterval = executorsIntervals[i];
+          if (value < currentInterval.end && value >= currentInterval.start) {
+            return currentInterval.item
+          }
+        }
+      }
+    }
+
+    const queryTypeRatioConfig = [
+      {
+        ratio: 0.1,
+        item: readLabels
+      },
+      {
+        ratio: 0.1,
+        item: readLabelValues
+      },
+      {
+        ratio: 0.1,
+        item: readSeries
+      },
+      {
+        ratio: 0.5,
+        item: readRange
+      },
+      {
+        ratio: 0.2,
+        item: readInstant
+      },
+    ];
+
+    const selectQueryTypeByRatio = createSelectorByRatio(queryTypeRatioConfig);
+
+    const rangesRatioConfig = [
+      {
+        ratio: 0.2,
+        item: '15m'
+      },
+      {
+        ratio: 0.2,
+        item: '30m'
+      },
+      {
+        ratio: 0.3,
+        item: '1h'
+      },
+      {
+        ratio: 0.2,
+        item: '3h'
+      },
+      {
+        ratio: 0.1,
+        item: '12h'
+      },
+    ];
+
+    const selectRangeByRatio = createSelectorByRatio(rangesRatioConfig);
+
+    /**
+    * Entrypoint for read scenario
+    */
+    export function read() {
+      selectQueryTypeByRatio(Math.random())();
+    }
+
+    /**
+    * Execute labels query with given client
+    */
+    function readLabels() {
+      // Randomly select the range.
+      const range = selectRangeByRatio(Math.random())
+      // Execute query.
+      let res = read_client.labelsQuery(range);
+      // Assert the response from loki.
+      checkResponse(res, "successful labels query", range);
+    }
+
+    /**
+    * Execute label values query with given client
+    */
+    function readLabelValues() {
+      // Randomly select label name from pull of the labels.
+      const label = randomChoice(Object.keys(read_conf.labels));
+      // Randomly select the range.
+      const range = selectRangeByRatio(Math.random());
+      // Execute query.
+      let res = read_client.labelValuesQuery(label, range);
+      // Assert the response from loki.
+      checkResponse(res, "successful label values query", range);
+    }
+
+    const limit = 1000;
+
+    const instantQuerySuppliers = [
+      () => `rate({app="${randomChoice(read_conf.labels.app)}"}[5m])`,
+      () => `sum by (namespace) (rate({app="${randomChoice(read_conf.labels.app)}"} [5m]))`,
+      () => `sum by (namespace) (rate({app="${randomChoice(read_conf.labels.app)}"} |~ ".*a" [5m]))`,
+      () => `sum by (namespace) (rate({app="${randomChoice(read_conf.labels.app)}"} |= "USB" [5m]))`,
+      () => `sum by (status) (rate({app="${randomChoice(read_conf.labels.app)}"} | json | __error__ = "" [5m]))`,
+      // () => `sum by (_client) (rate({app="${randomChoice(read_conf.labels.app)}"} | logfmt | __error__=""  | _client="" [5m]))`,
+      () => `sum by (namespace) (sum_over_time({app="${randomChoice(read_conf.labels.app)}"} | json | __error__ = "" | unwrap bytes [5m]))`,
+      () => `quantile_over_time(0.99, {app="${randomChoice(read_conf.labels.app)}"} | json | __error__ = "" | unwrap bytes [5m]) by (namespace)`,
+    ];
+
+    /**
+    * Execute instant query with given client
+    */
+    function readInstant() {
+      // Randomly select the query supplier from the pool
+      // and call the supplier that provides prepared query.
+      const query = randomChoice(instantQuerySuppliers)();
+      // Execute query.
+      let res = read_client.instantQuery(query, limit);
+      // Assert the response from loki.
+      checkResponse(res, "successful instant query");
+    }
+
+    const rangeQuerySuppliers = [
+      ...instantQuerySuppliers,
+      () => `{app="${randomChoice(read_conf.labels.app)}"}`,
+      () => `{app="${randomChoice(read_conf.labels.app)}"} |= "USB" != "USB"`,
+      () => `{app="${randomChoice(read_conf.labels.app)}"} |~ "US.*(a|o)"`,
+      () => `{app="${randomChoice(read_conf.labels.app)}", format="json"} | json | status < 300`,
+    ]
+
+    /**
+    * Execute range query with given client
+    */
+    function readRange() {
+      // Randomly select the query supplier from the pool
+      // and call the supplier that provides prepared query.
+      const query = randomChoice(rangeQuerySuppliers)();
+      // Randomly select the range.
+      let range = selectRangeByRatio(Math.random());
+      // Execute query.
+      let res = read_client.rangeQuery(query, range, limit);
+      // Assert the response from loki.
+      checkResponse(res, "successful range query", range);
+    }
+
+    let seriesSelectorSuppliers = [
+      () => `{app="${randomChoice(read_conf.labels.app)}"}`,
+      () => `{namespace="${randomChoice(read_conf.labels.namespace)}"}`,
+      () => `{format="${randomChoice(read_conf.labels.format)}"}`,
+      () => `{pod="${randomChoice(read_conf.labels.pod)}"}`,
+    ];
+
+    /**
+    * Execute series query with given client
+    */
+    function readSeries() {
+      // Randomly select the range.
+      let range = selectRangeByRatio(Math.random());
+      // Randomly select the series selector from the pool of selectors.
+      let selector = randomChoice(seriesSelectorSuppliers)();
+      // Execute query.
+      let res = read_client.seriesQuery(selector, range);
+      // Assert the response from loki.
+      checkResponse(res, "successful series query", range);
+    }
+
+
+    const checkResponse = (response, name, range) => {
+      const checkName = `${name}[${range}]`;
+      const assertion = {};
+      assertion[range ? checkName : name] = (res) => {
+        let success = res.status === 200;
+        if (!success) {
+          console.log(res.status, res.body);
+        }
+        return success;
+      };
+      check(response, assertion);
+    }
+
+    /**
+    * Return an item of random choice of a list
+    */
+    function randomChoice(items) {
+      return items[Math.floor(Math.random() * items.length)];
+    }
+---
+# apiVersion: batch/v1
+# kind: Job
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: k6-logs-benchmark
+spec:
+  serviceName: k6-logs-benchmark
+  selector:
+    matchLabels:
+      name: k6-logs-benchmark
+  template:
+    metadata:
+      labels:
+        name: k6-logs-benchmark
+    spec:
+      # restartPolicy: Never
+      nodeSelector:
+        dedicated-pool: grafana-enterprise-stack
+      tolerations:
+      - effect: NoSchedule
+        key: dedicated-pool
+        operator: Equal
+        value: grafana-enterprise-stack
+      containers:
+        - name: k6-logs-benchmark
+          image: basvdl/k6-custom
+          env:
+            - name: BASE_URL
+              value: 'gel-enterprise-logs-gateway.fo-monitoring-gel.svc:3100'
+            - name: USERNAME
+              value: perf
+            - name: WRITE_TOKEN
+              value: cGVyZi10ZXN0MzozazIrPT04NjQ8VyIyOD17LzY5NyNse0w=
+            - name: READ_TOKEN
+              value: cGVyZi10ZXN0MzozazIrPT04NjQ8VyIyOD17LzY5NyNse0w=
+          args:
+            - run
+            - /k6/script.js
+          volumeMounts:
+          - name: k6-script
+            mountPath: /k6
+      volumes:
+        - name: k6-script
+          configMap:
+            name: k6-job

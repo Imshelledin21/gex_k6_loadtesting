@@ -1,0 +1,550 @@
+# kubectl -n fo-monitoring-gem apply -f metrics-bench-k8s.yaml
+# kubectl -n fo-monitoring-gem delete -f metrics-bench-k8s.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-job
+data:
+  script.js: |-
+    import { check, fail } from 'k6';
+    import encoding from 'k6/encoding';
+    import exec from 'k6/execution';
+    import remote from 'k6/x/remotewrite';
+
+    // import { describe, expect } from 'https://jslib.k6.io/k6chaijs/4.3.4.1/index.js';
+    // import { randomIntBetween } from "https://jslib.k6.io/k6-utils/1.1.0/index.js";
+    // import { Httpx } from 'https://jslib.k6.io/httpx/0.0.6/index.js';
+    import { describe, expect } from '/modules/k6chaijs.js';
+    import { randomIntBetween } from '/modules/k6-utils.js';
+    import { Httpx } from '/modules/httpx.js';
+
+
+    /**
+    * GEM token that has MetricsPublisher role.
+    * @constant {string}
+    */
+    const WRITE_TOKEN = __ENV.WRITE_TOKEN || fail("WRITE_TOKEN environment variable missing");
+    /**
+    * GEM token that has Viewer role.
+    * @constant {string}
+    */
+    const READ_TOKEN = __ENV.READ_TOKEN || fail("READ_TOKEN environment variable missing");
+    /**
+    * GEM user ID
+    * @constant {string}
+    */
+    const USERNAME = __ENV.USERNAME || fail("USERNAME environment variable missing");
+    /**
+    * URL of the GEM gateway
+    * @constant {string}
+    */
+    const BASE_URL = __ENV.BASE_URL || fail("provide BASE_URL when strting k6");
+
+    /**
+    * Write path config + helpers.
+    */
+    const WRITE_TEMPLATE = remote.precompileLabelTemplates({
+            __name__:        'k6_generated_metric_${series_id}',  // Name of the series.
+            series_id:       '${series_id}',                      // Each value of this label will match 1 series.
+            cardinality_1e3: '${series_id/1000}',                 // Each value of this label will match 1000 series.
+            label_50:        '${series_id%50}',                   // There are 50 possible values of this label
+            label_13:        '${series_id%7}',                    // There are 7 possible values of this label
+            label_5:         '${series_id%5}',                    // There are 5 possible values of this label
+            label_2:         '${series_id%2}',                    // There are 2 possible values of this label
+            le:              '${series_id%5}',                    // The label 'le' is required for histogram_quantile queries: https://prometheus.io/docs/prometheus/latest/querying/functions/#histogram_quantile
+        });
+    /**
+    * Number of remote-write requests sent per k6 time unit at minimum throuput.
+    * @constant {number}
+    */
+    const MIN_WRITE_REQUEST_RATE = 80;
+    /**
+    * Number of remote-write requests sent per k6 time unit at maximum throughput.
+    * @constant {number}
+    */
+    const MAX_WRITE_REQUEST_RATE = 100;
+    /**
+    * Number of series per remote-write request.
+    * @constant {number}
+    */
+    const WRITE_SERIES_PER_REQUEST = 25000;
+    /**
+    * Number of VUs total to allocate for writes
+    */
+    const WRITE_VUS = 20;
+
+    /**
+    * To ensure we query existing history metrics we keep querying the first n series.
+    * @constant {number}
+    */
+    const TOTAL_SERIES_FOR_QUERYING = 1e6;
+    /**
+    * Simulated client scrape interval in seconds
+    * @constant {number}
+    */
+    const SCRAPE_INTERVAL_SECONDS = 15;
+
+    const remote_write_url = `http://${USERNAME}:${WRITE_TOKEN}@${BASE_URL}/api/prom/push`;
+    const write_client = new remote.Client({ url: remote_write_url, timeout: '32s' });
+
+    const query_client = new Httpx({
+        baseURL: `http://${BASE_URL}/api/prom/api/v1`,
+        headers: {
+            'User-Agent': 'k6-load-test',
+            "Content-Type": 'application/x-www-form-urlencoded',
+            "Authorization": `Basic ${encoding.b64encode(`${USERNAME}:${READ_TOKEN}`)}`
+        },
+        timeout: 240e3 // 240s timeout.
+    });
+
+    //
+    // Read path config + helpers.
+    //
+    /**
+    * Allocated VUs for range read requests
+    */
+    const READ_RANGE_VU = 10;
+    /**
+    * Allocated VUs for instant read requests
+    */
+    const READ_INSTANT_VU = 10;
+
+    /**
+    * Number of seconds in one hour.
+    * @constant {number}
+    */
+    const HOUR_SECONDS = 60 * 60;
+    /**
+    * Number of seconds in one day.
+    * @constant {number}
+    */
+    const DAY_SECONDS = 24 * HOUR_SECONDS;
+    /**
+    * Number of seconds in one week.
+    * @constant {number}
+    */
+    const WEEK_SECONDS = 7 * DAY_SECONDS;
+    /**
+    * The percentage of metrics we expect to touch when querying as a decimal. It's not realistic
+    * that a customer would query back all metrics they push but instead they typically touch a subset of these
+    * metrics when querying.
+    * @constant {number}
+    */
+    const QUERY_METRICS_SUBSET = 0.3;
+
+    /**
+    * The oldest timestamp (in seconds) that can be queried with range queries. This is used to prevent to
+    * query metrics having a different set of labels in the past and thus causing the error:
+    * "vector cannot contain metrics with the same labelset".
+    * @constant {number}
+    */
+    const QUERY_MIN_TIME_SECONDS = Date.parse("2022-03-10T20:56:00Z") / 1000;
+
+    const WRITE_STAGES = [
+        {
+            target: (MIN_WRITE_REQUEST_RATE), duration: `5m`,
+        }, {
+            target: (MAX_WRITE_REQUEST_RATE), duration: `25m`,
+        }
+    ]
+
+    let TOTAL_DURATION_MIN = 0;
+    for (let stage of WRITE_STAGES) {
+        TOTAL_DURATION_MIN += parseInt(stage.duration);
+    }
+    TOTAL_DURATION_MIN;
+
+    /**
+    * Exported configuration options for the k6 workers.
+    * @constant {object}
+    */
+    export const options = {
+        insecureSkipTLSVerify: true,
+        thresholds: {
+            // SLA: 99.9% of writes succeed.
+            'checks{type:write}': ['rate > 0.999'],
+            // 99.9% of writes take less than 10s (SLA has no guarantee on write latency).
+            [`http_req_duration{url:${remote_write_url}}`]: ['p(99.9) < 10000'],
+            // SLA: 99.9% of queries succeed.
+            'checks{type:read}': ['rate > 0.999'],
+            // SLA: average query time for any 3 hours of data is less than 2s (not including Internet latency).
+            'http_req_duration{type:read}': ['avg < 2000'],
+        },
+        scenarios: {
+            // In each SCRAPE_INTERVAL_SECONDS, WRITE_REQUEST_RATE number of remote-write requests will be made.
+            writing_metrics: {
+                executor: 'ramping-arrival-rate', // https://k6.io/docs/using-k6/scenarios/executors/ramping-arrival-rate
+                startRate: MIN_WRITE_REQUEST_RATE, // Number of iterations to execute each timeUnit period at test start.
+                timeUnit: `${SCRAPE_INTERVAL_SECONDS}s`, // Period of time to apply the startRate to the stages' target value. Its value is constant for the whole duration of the scenario, it is not possible to change it for a specific stage. 
+
+                preAllocatedVUs: WRITE_VUS, // Number of VUs to pre-allocate before test start in order to preserve runtime resources.
+                exec: 'write', // function to execute
+
+                stages: WRITE_STAGES,
+            },
+            reads_range_queries: {
+                executor: 'constant-arrival-rate', // https://k6.io/docs/using-k6/scenarios/executors/constant-arrival-rate/
+                rate: 10, // Number of iterations to start during each timeUnit period.
+                timeUnit: '1s', // Period of time to apply the rate value.
+                duration: `${TOTAL_DURATION_MIN}m`, // Total scenario duration (excluding gracefulStop).
+                preAllocatedVUs: READ_RANGE_VU, // Number of VUs to pre-allocate before test start to preserve runtime resources.
+                exec: 'run_range_query' // function to execute
+            },
+            reads_instant_queries: {
+                executor: 'constant-arrival-rate',
+                rate: 30,
+                timeUnit: '1s',
+                duration: `${TOTAL_DURATION_MIN}m`,
+                preAllocatedVUs: READ_INSTANT_VU,
+                exec: 'run_instant_query_cardinality'
+            },
+        },
+    };
+
+    function currentRequestRate(startTime) {
+    let currentMin = ((new Date() - new Date(startTime)) / 1000) / 60;
+
+    for (let stage of WRITE_STAGES) {
+        const stageDuration = parseInt(stage.duration);
+        if (currentMin > stageDuration) {
+            currentMin -= stageDuration;
+            continue;
+        }
+        return stage.target;
+    }
+    return 0;
+    }
+
+    function currentTotalSeries(startTime) {
+    return currentRequestRate(startTime) * WRITE_SERIES_PER_REQUEST;
+    }
+
+    /**
+    * Generates and writes series, checking the results.
+    * Requests are tagged with { type: "write" } so that they can be distinguished from queries.
+    */
+    export function write() {
+    try {
+        // iteration only advances after every second test iteration,
+        // because we want to send every series twice to simulate HA pairs.
+        const iteration = exec.scenario.iterationInTest
+
+        // min_series_id is calculated based on the current iteration number.
+        // It is used to define which batch of the total set of series which we're going to generate will be sent in this request.
+        const total_series = currentTotalSeries(exec.scenario.startTime);
+        const min_series_id = (iteration % (total_series / WRITE_SERIES_PER_REQUEST)) * WRITE_SERIES_PER_REQUEST;
+        const max_series_id = min_series_id + WRITE_SERIES_PER_REQUEST;
+        const now_ms = Date.now();
+        const now_s = Math.floor(now_ms/1000);
+
+        const res = write_client.storeFromPrecompiledTemplates(
+            // We're using the timestamp in seconds as a value because counters are very common in Prometheus and
+            // counters usually are a number that increases over time, by using the timestamp in seconds we
+            // hope to achieve a similar compression ratio as counters do.
+            now_s,                                                 // Minimum of randomly chosen sample value.
+            now_s,                                                 // Maximum of randomly chosen sample value.
+
+            now_ms,                                                // Time associated with generated samples.
+            min_series_id,                                         // Minimum series ID.
+            max_series_id,                                         // Maximum series ID.
+            WRITE_TEMPLATE,
+        );
+        if (!check(res, {
+            'write worked': (r) => r.status === 200,
+        }, { type: "write" })) {
+            console.warn(`ERR: write failed. Status: ${res.status}. Body: ${res.body}`);
+            fail(`ERR: write failed. Status: ${res.status}.`);
+        }
+    }
+    catch (e) {
+        check(null, {
+            'write worked': () => false,
+        }, { type: "write" });
+        throw e;
+    }
+    }
+
+    // Note: This is a map, so you are required to use unique keys
+    const query_distribution = {
+    25: 'sum by (label_50) (irate($metric[$rate_interval]))',
+    22: 'sum($metric)',
+    23: 'histogram_quantile(0.9, sum by (le, label_50) (rate($metric[$rate_interval])))',
+    20: 'sum(rate($metric[$rate_interval]))',
+    10: 'avg($metric)'
+    }
+
+    /**
+    * The distribution of time ranges, rate interval and queries used to generate random range queries executed on the target.
+    * For each configurable setting the key is the distribution percentage as float from 0 to 100.
+    * The value is the setting value that will be used a % (distribution) number of times.
+    * @constant {object}
+    */
+    // Ranges over a day disabled due to lack of data.
+    const range_query_distribution = {
+    time_range: {
+        50: 1 * HOUR_SECONDS,
+        30: 0.5 * HOUR_SECONDS,
+        20: 2 * HOUR_SECONDS,
+    },
+    rate_interval: {
+        1: '1h',
+        9: '10m',
+        20: '5m',
+        70: '1m',
+    },
+    query: query_distribution,
+    cardinality: {
+        99.99: 1e3, // 1k
+        .01: 5e6, // 5M
+    },
+    };
+
+    /**
+    * The distribution of rate intervals and queries used to generate random instant queries executed on the target.
+    * For each configurable setting the key is the distribution percentage as float from 0 to 100.
+    * The value is the setting value that will be used a % (distribution) number of times.
+    * @constant {object}
+    */
+    const instant_query_cardinality_distribution = {
+    rate_interval: {
+        20: '5m',
+        70: '1m',
+        10: '10m'
+    },
+    query: query_distribution,
+    cardinality: {
+        99.99: 1e3, // 10k
+        .01: 5e6, // 5M
+    },
+    };
+
+    // Ensure all distributions sum up to 100%.
+    assert_distribution_config(range_query_distribution);
+    assert_distribution_config(instant_query_cardinality_distribution);
+
+    function assert_distribution_config(config) {
+    for (const [name, distribution] of Object.entries(config)) {
+        let sum = 0;
+        for (const [percent, range] of Object.entries(distribution)) {
+            sum += parseFloat(percent);
+        }
+
+        if (sum != 100) {
+            throw new Error(`${name} distribution is invalid (total sum is ${sum}% while 100% was expected)`);
+        }
+    }
+    }
+
+    /**
+    * Returns a random float number between min and max.
+    * @param {number} min The min value.
+    * @param {number} max The max value
+    * @returns {number}
+    */
+    function random_float_between(min, max) {
+    return min + (Math.random() * (max - min))
+    }
+
+    /**
+    * Returns a random entry from the provided config object where the object keys are the percentage of the distribution as a float.
+    * Given a sufficiently large number of calls to this function, each
+    * value is returned from the config a number of times (in %) close to the configured distribution (key).
+    * @param {object} config An object with keys representing the percentage within the distribution.
+    * @return {any} A random value from the config object.
+    */
+    function get_random_entry_from_config(config) {
+    const rand = random_float_between(0, 100);
+    let sum = 0;
+
+    for (const [percent, value] of Object.entries(config)) {
+        sum += parseFloat(percent);
+
+        if (sum >= rand) {
+            return value;
+        }
+    }
+
+    throw new Error(`get_random_entry_from_config() has not been able to find a distribution config for random value ${rand} but this should never happen`);
+    }
+
+    /**
+    * Returns a random rate() query from the with possibly substituted values for metric names and rate intervals.
+    * @param {object} config An object with keys representing the percentage within the distribution.
+    * Values should be query strings with that may contain $metric and $rate_interval for substitution.
+    * @param {string} rate_interval The rate interval as a string parseable by the Prometheus duration format.
+    * @return {string} A Prometheus query expression.
+    */
+    function get_random_query_from_config(config, cardinality, rate_interval) {
+    // Find the max group ID (0 based) based on the given query cardinality.
+    const cardinality_group_max_id = Math.floor(TOTAL_SERIES_FOR_QUERYING / cardinality) - 1;
+
+    // Query a group between 0 and the max, honoring QUERY_METRICS_SUBSET. Pick a random one
+    // instead of relying it on "iterationInTest" in order to reduce cache hit ratio (eg. when
+    // the test restarts).
+
+    // Pick the correct label name to query
+    var label_text = '1e3'
+    if(cardinality == 5e6){
+        label_text = '5e6'
+    }
+
+    const cardinality_group_id = randomIntBetween(0, Math.ceil(cardinality_group_max_id * QUERY_METRICS_SUBSET));
+    const metric_selector = `{cardinality_${label_text}="${cardinality_group_id}"}`;
+
+    // Get a random query from config and replace placeholders.
+    let query = get_random_entry_from_config(config);
+    query = query.replace(/\$metric/g, metric_selector);
+    query = query.replace(/\$rate_interval/g, rate_interval);
+    return query;
+    }
+
+    /**
+    * Roughly simulates the behavior of the Grafana step calculation based on time range.
+    * @param {number} time_range Query time range in seconds.
+    * @return {number} The step in seconds.
+    */
+    function get_range_query_step(time_range) {
+    return Math.max(15, Math.ceil(time_range / 1440));
+    }
+
+    /**
+    * Aligns the provided timestamp to step.
+    * @param {number} ts Timestamp in seconds.
+    * @param {number} step Step in seconds.
+    * @returns {number}
+    */
+    function align_timestamp_to_step(ts, step) {
+    if (ts % step === 0) {
+        return ts
+    }
+
+    return ts - (ts % step)
+    }
+
+    /**
+    * Runs a range query randomly generated based on the configured distribution defined in range_query_distribution.
+    * It validate that a successful response is received and tags requests with { type: "read" } so that requests can be distinguished from writes.
+    */
+    export function run_range_query() {
+    const name = "range query";
+
+    const time_range = get_random_entry_from_config(range_query_distribution.time_range);
+    const step = get_range_query_step(time_range);
+    const end = align_timestamp_to_step(Math.ceil(Date.now() / 1000), step);
+    const start = align_timestamp_to_step(Math.max(end - time_range, QUERY_MIN_TIME_SECONDS), step);
+    const rate_interval = get_random_entry_from_config(range_query_distribution.rate_interval);
+    const cardinality = get_random_entry_from_config(range_query_distribution.cardinality);
+    const query = get_random_query_from_config(range_query_distribution.query, cardinality, rate_interval);
+
+    console.debug("range query - time_range:", time_range, "start:", start, "end:", end, "step:", step, "query:", query)
+
+    describe(name, () => {
+        const res = query_client.post('/query_range', {
+            query: query,
+            start: start,
+            end: end,
+            step: `${step}s`,
+        }, {
+            tags: {
+                name: `${name} - ${time_range / HOUR_SECONDS} hours`,
+                type: "read",
+            },
+        });
+        if (!check(res, {
+            'range read success': (r) => res.status === 200,
+        }, { type: "read" })) {
+            console.warn(`ERR: range read failed. Query: ${query} Time Range: ${time_range / HOUR_SECONDS}h Status: ${res.status}. Body: ${res.body}`);
+            fail(`ERR: range read failed. Status: ${res.status}.`);
+        }
+        expect(res).to.have.validJsonBody();
+        expect(res.json('status'), "status field is 'success'").to.equal("success");
+        expect(res.json('data.resultType'), "resultType is 'matrix'").to.equal("matrix");
+    });
+    }
+
+    /**
+    * See run_instant_query().
+    */
+    export function run_instant_query_cardinality() {
+    run_instant_query("instant query", instant_query_cardinality_distribution)
+    }
+
+    /**
+    * Runs an instant query randomly generated based on the configured distribution defined in instant_query_distribution.
+    * It validate that a successful response is received and tags requests with { type: "read" } so that requests can be distinguished from writes.
+    * Instant queries are run with a time one minute in the past to simulate rule evaluations.
+    */
+    export function run_instant_query(name, config) {
+    const time = Math.ceil(Date.now() / 1000) - 60;
+    const rate_interval = get_random_entry_from_config(config.rate_interval);
+    const cardinality = get_random_entry_from_config(config.cardinality);
+    const query = get_random_query_from_config(config.query, cardinality, rate_interval);
+
+    console.debug(name, " - query: ", query)
+
+    describe(name, () => {
+        const res = query_client.post('/query', {
+            query: query,
+            time: time,
+        }, {
+            tags: {
+                name: name,
+                type: "read",
+            }
+        });
+
+        if (!check(res, {
+            'instant read success': (r) => res.status === 200,
+        }, { type: "read" })) {
+            console.warn(`ERR: instant read failed. Query: ${query} Status: ${res.status}. Body: ${res.body}`);
+            fail(`ERR: instant read failed. Status: ${res.status}.`);
+        }
+        expect(res).to.have.validJsonBody();
+        expect(res.json('status'), "status field").to.equal("success");
+        expect(res.json('data.resultType'), "data.resultType field").to.equal("vector");
+    });
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k6-metrics-benchmark
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: k6-metrics-benchmark
+  template:
+    metadata:
+      labels:
+        name: k6-metrics-benchmark
+    spec:
+      nodeSelector:
+        dedicated-pool: grafana-enterprise-stack
+      tolerations:
+      - effect: NoSchedule
+        key: dedicated-pool
+        operator: Equal
+        value: grafana-enterprise-stack
+      containers:
+        - name: k6-metrics-benchmark
+          image: basvdl/k6-custom
+          env:
+            - name: BASE_URL
+              value: 'gem-enterprise-metrics-gateway.fo-monitoring-gem.svc:8080'
+            - name: USERNAME
+              value: perf
+            - name: WRITE_TOKEN
+              value: cGVyZi1wZXJmOj4zNTEjLzUydi0+fDBQSzUyOT1AbUA3Ww==
+            - name: READ_TOKEN
+              value: cGVyZi1wZXJmOj4zNTEjLzUydi0+fDBQSzUyOT1AbUA3Ww==
+          args:
+            - run
+            - /k6/script.js
+          volumeMounts:
+          - name: k6-script
+            mountPath: /k6
+      volumes:
+        - name: k6-script
+          configMap:
+            name: k6-job
